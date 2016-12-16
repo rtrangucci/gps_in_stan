@@ -1,0 +1,510 @@
+---
+title: "Hierarchical Gaussian Processes in Stan"
+author: Rob Trangucci based on Andrew Gelman's blog post
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document: default
+---
+
+After a full month straight of modeling 2016 election data in \texttt{Stan} and
+\texttt{rstanarm} I'd rather do some forecasting! That seems sunnier to me.
+
+Andrew hosted this on his blog recently; a newpaper had asked some researchers
+if they would forecast the 2020, 2024 and 2028 state-wide presidential votes. As
+absurd as this sounds, let's dive into the problem, and see how we can use GPs in
+rstan can attack this problem.
+
+```{r load_packages, results="hide", message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(rstan)
+library(reshape2)
+```
+
+Let's load the data:
+
+```{r}
+past_votes <- readRDS('data_pres_forecast/pres_vote_historical.RDS') %>%
+  filter(state != 'DC')
+```
+
+We're going to exclude DC because it's so different from the other states. We
+don't necessarily want to have DC impact our estimates for other states because
+it'll affect our hierarchical variance estimates.
+
+```{r}
+head(past_votes)
+```
+
+The observations are the counts of the two-party vote in each state by each
+presidential election. Let's see how many years we have to work with:
+
+```{r}
+table(past_votes$state)
+```
+
+We have only 11 observations per state, which isn't very many. But perhaps there
+is extra structure that we can use to partially pool observations together. Let's
+group the states into regions, and calculate our outcome variable.
+
+The outcome we care about is the Republican share of the two-party vote by year
+by state.
+
+```{r}
+state_groups <- list(c("ME","NH","VT","MA","RI","CT"),
+                      c("NY","NJ","PA","MD","DE"),
+                      c("OH","MI","IL","WI","MN"),
+                      c("WA","OR","CA","HI"),
+                      c("AZ","CO","NM","NV"),
+                      c("IA","NE","KS","ND","SD"),
+                      c("KY","TN","MO","WV","IN"),
+                      c("VA","OK","FL","TX","NC"),
+                      c("AL","MS","LA","GA","SC","AR"),
+                      c("MT","ID","WY","UT","AK"))
+region_names <- c("New England", "Mid-Atlantic", "Midwest", "West Coast",
+                  "Southwest","Plains", "Border South", "Outer South", "Deep South",
+                  "Mountain West")
+state_region_map <- mapply(FUN = function(states, region) 
+  data.frame(state = states, 
+             region = rep(region,length(states)),
+             stringsAsFactors = F),state_groups,region_names,
+  SIMPLIFY = F)
+
+state_region_map <- bind_rows(state_region_map) %>%
+  arrange(state) %>% mutate(
+    region_ind = as.integer(as.factor(region))
+  )
+```
+
+We have 10 regions, with about 5 states per region. In order to get the data
+into the right form for Stan, we need a list of integers that map each
+observation to a state, and a separate vector for regions. 
+
+We'll also need mean turnout per year in order to properly weight the
+observations at the state level. We want to some estimate as to whether the
+state had a larger-than-average turnout compared to the average state each year.
+
+```{r}
+mean_turnout <- past_votes %>% group_by(year) %>%
+  summarise(mean_turnout = exp(mean(log(dem + rep))))
+```
+
+Joining all the data together will allow us to plot everything, which will
+elucidate the structure of the data.
+
+```{r}
+year_map <- data.frame(year = sort(unique(past_votes$year)),
+                       year_ind = 1:11)
+past_votes <- past_votes %>%
+  left_join(mean_turnout, by = 'year') %>%
+  arrange(state, year) %>%
+  left_join(state_region_map, by = 'state') %>%
+  left_join(year_map, by = 'year') %>%
+  mutate(
+    state_ind = as.integer(as.factor(state)),
+    two_party_turnout = dem + rep,
+    y = rep / two_party_turnout,
+    relative_turnout = two_party_turnout / mean_turnout,
+    turnout_weight = relative_turnout^(-0.5)
+  )
+```
+
+Here's the state and region indices matched to each observation:
+
+```{r}
+head(past_votes[,c('year','state','state_ind','region','region_ind','y')])
+```
+
+```{r}
+tail(past_votes[,c('year','state','state_ind','region','region_ind','y')])
+```
+
+We're going to plot the time series of the Repulican share of the two-party vote
+in each state for the past 11 presidential elections.
+
+```{r}
+past_votes %>%
+  ggplot(aes(x = year, y = y, colour = state)) +
+  geom_line() + facet_wrap(~ region) +
+  theme_bw() + theme(legend.position = 'None') +
+  ylab('Republican share of two-party vote') + xlab('Year')
+
+```
+
+We can see some patterns that we might want to include in a model. Most notably,
+and perhaps not surprisingly, we see that there is a cross-sectional national
+correlation each year. There look to be time-invariate state-level mean Republican
+shares. There's also a clustering that occurs at the region level. There should
+likely be a time-invariatne regional offset.
+
+Within regions, there is also a clear time trend. Some states don't strictly
+adhere to the regional trend. There is a longer-term trend, and then short-term
+deviations away from the trend. This suggests a model structure like so:
+
+\begin{align*}
+y_{t,j} & \sim \text{Normal}(\mu_{t,j}, \sigma) \\
+\mu_{t,j} & = \theta_t^{\text{year}} 
+            + \theta_j^{\text{state}}
+            + \theta_{k[j]} ^{\text{region}} \\
+           & + \gamma_{t,j} + \delta_{t,k[j]} \\
+\boldsymbol{\gamma_{j}} & \sim \text{MultiNormal}(0, K_{\ell^\gamma_1, \alpha^\gamma_1} + K_{\ell^\gamma_2, \alpha^\gamma_2}) \\
+\boldsymbol{\delta_{k}} & \sim \text{MultiNormal}(0, K_{\ell^\delta_1, \alpha^\delta_1} + K_{\ell^\delta_2, \alpha^\delta_2})
+\end{align*}
+
+In order to properly identify the model, we'll need strong priors over
+all of the parameters, because we don't have very much data to work with. A quick and 
+dirty way to formulate priors that have good shrinkage properties is to put hierarchcial
+shrinkage priors on our $\theta_j^{\text{state}}$ and $\theta_{k}^{\text{region}}$:
+
+\begin{align*}
+\theta_j^{\text{state}} & \sim \text{Normal}(0, \sigma^\text{state}) \\
+\theta_{k}^{\text{region}} & \sim \text{Normal}(0, \sigma^\text{region}) \\
+\end{align*}
+
+Note that we might even want to put more structure into the variance
+parameters for the state-level time-invariant means:
+
+\begin{align*}
+\theta_j^{\text{state}} & \sim \text{Normal}(0, \sigma_{k[j]}^\text{state}) \\
+\end{align*}
+
+In order to build forecasts, we'll also need a map of state to region. We have the
+map from observation to regions from above, but we can use that to build a map
+that is correctly ordered from state to region:
+
+```{r}
+stan_state_region_map <- unique(past_votes[,c('state_ind','region_ind')]) %>%
+  arrange(state_ind)
+```
+
+```{r}
+head(stan_state_region_map)
+```
+
+Now we prep the data for RStan:
+
+```{r}
+to_stan <- with(past_votes,
+                 list(
+                   N = dim(past_votes)[1],
+                   state_region_ind = stan_state_region_map$region_ind,
+                   N_states = length(unique(past_votes$state)),
+                   N_regions = length(unique(past_votes$region)),
+                   N_years_obs = length(unique(past_votes$year)),
+                   state_ind = state_ind,
+                   region_ind = region_ind,
+                   turnout_weight = turnout_weight,
+                   y = y,
+                   year_ind = year_ind,
+                   N_years = 14))
+
+```
+
+The model is quite large, so bear with me as we walk through each of the 
+different sections.
+
+```{r engine='cat', engine.opts = list(file = "hierarchical_gp.stan", lang = "stan")}
+data {
+  int<lower=1> N;
+  int<lower=1> N_states;
+  int<lower=1> N_regions;
+  int<lower=1> N_years_obs;
+  int<lower=1> N_years;
+  int<lower=1> state_region_ind[N_states];
+  int<lower=1,upper=50> state_ind[N];
+  int<lower=1,upper=10> region_ind[N];
+  int<lower=1> year_ind[N];
+  vector<lower=0>[N] turnout_weight;
+  vector<lower=0,upper=1>[N] y;
+}
+transformed data {
+  real years[N_years];
+  vector[17] counts;
+
+  for (t in 1:N_years)
+    years[t] = t;
+  for (i in 1:17)
+    counts[i] = 2;
+}
+parameters {
+  matrix[N_years,N_regions] GP_region_std;
+  matrix[N_years,N_states] GP_state_std;
+  vector[N_years_obs] year_std;
+  vector[N_states] state_std;
+  vector[N_regions] region_std;
+  real<lower=0> tot_var;
+  simplex[17] prop_var;
+  real mu;
+
+
+  real<lower=0> length_GP_region_long;
+  real<lower=0> length_GP_state_long;
+  real<lower=0> length_GP_region_short;
+  real<lower=0> length_GP_state_short;
+}
+transformed parameters {
+  matrix[N_years,N_regions] GP_region;
+  matrix[N_years,N_states] GP_state;
+
+  vector[N_years_obs] year_re;
+  vector[N_states] state_re;
+  vector[N_regions] region_re;
+  vector[17] vars;
+
+  real sigma_year;
+  real sigma_region;
+  vector[10] sigma_state;
+
+  real sigma_error_state_2;
+
+  real sigma_GP_region_long;
+  real sigma_GP_state_long;
+  real sigma_GP_region_short;
+  real sigma_GP_state_short;
+
+  vars = 17 * prop_var * tot_var;
+  sigma_year = sqrt(vars[1]);
+  sigma_region = sqrt(vars[2]);
+  for (i in 1:10)
+    sigma_state[i] = sqrt(vars[i + 2]);
+
+  sigma_GP_region_long = sqrt(vars[13]);
+  sigma_GP_state_long = sqrt(vars[14]);
+  sigma_GP_region_short = sqrt(vars[15]);
+  sigma_GP_state_short = sqrt(vars[16]);
+  sigma_error_state_2 = sqrt(vars[17]);
+
+  region_re = sigma_region * region_std;
+  year_re = sigma_year * year_std;
+  state_re = sigma_state[state_region_ind] .* state_std;
+  
+  {
+    matrix[N_years, N_years] cov_region; 
+    matrix[N_years, N_years] cov_state; 
+    matrix[N_years, N_years] L_cov_region; 
+    matrix[N_years, N_years] L_cov_state; 
+
+    cov_region = cov_exp_quad(years, sigma_GP_region_long, 
+                                  length_GP_region_long)
+               + cov_exp_quad(years, sigma_GP_region_short, 
+                                  length_GP_region_short);
+    cov_state = cov_exp_quad(years, sigma_GP_state_long, 
+                                  length_GP_state_long)
+               + cov_exp_quad(years, sigma_GP_state_short, 
+                                  length_GP_state_short);
+    for (year in 1:N_years) {
+      cov_region[year, year] = cov_region[year, year] + 1e-6;
+      cov_state[year, year] = cov_state[year, year] + 1e-6;
+    }
+
+    L_cov_region = cholesky_decompose(cov_region);
+    L_cov_state = cholesky_decompose(cov_state);
+    GP_region = L_cov_region * GP_region_std;
+    GP_state = L_cov_state * GP_state_std;
+  }
+}
+model {
+  vector[N] obs_mu;
+
+  for (n in 1:N) {
+    obs_mu[n] = mu + year_re[year_ind[n]] 
+              + state_re[state_ind[n]] 
+              + region_re[region_ind[n]]
+              + GP_region[year_ind[n],region_ind[n]]
+              + GP_state[year_ind[n],state_ind[n]];
+  }
+  y ~ normal(obs_mu, sigma_error_state_2); #* turnout_weight);
+
+  to_vector(GP_region_std) ~ normal(0, 1);
+  to_vector(GP_state_std) ~ normal(0, 1);
+  year_std ~ normal(0, 1);
+  state_std ~ normal(0, 1);
+  region_std ~ normal(0, 1);
+  mu ~ normal(.5, .5);
+  tot_var ~ gamma(3, 3);
+  prop_var ~ dirichlet(counts);
+  length_GP_region_long ~ weibull(30,8);
+  length_GP_state_long ~ weibull(30,8);
+  length_GP_region_short ~ weibull(30,3);
+  length_GP_state_short ~ weibull(30,3);
+}
+generated quantities {
+  matrix[N_years,N_states] y_new;
+  matrix[N_years,N_states] y_new_pred;
+
+  {
+    real level;
+    level = normal_rng(0.5, sigma_year);
+    for (state in 1:N_states) {
+      for (t in 1:N_years) {
+        if (t < 12) {
+          y_new[t,state] = state_re[state] 
+                         + region_re[state_region_ind[state]]
+                         + GP_state[t,state]
+                         + GP_region[t,state_region_ind[state]]
+                         + (mu + year_re[t]);
+        } else {
+          y_new[t,state] = state_re[state] 
+                         + region_re[state_region_ind[state]]
+                         + GP_state[t,state]
+                         + GP_region[t,state_region_ind[state]]
+                         + level;
+        }
+        y_new_pred[t,state] = normal_rng(y_new[t,state],
+                                         sigma_error_state_2);
+      }
+    }
+  }
+}
+```
+
+```{r}
+compiled_model <- stan_model("hierarchical_gp.stan")
+fit <- sampling(compiled_model, data = to_stan, iter = 1000,
+                chains = 4, cores = 2, seed = 1245860998)
+```
+
+Let's inspect the results for convergence of parameters.
+
+```{r}
+sum_fit <- summary(fit)
+tail(sort(sum_fit$summary[,'Rhat']))
+head(round(100*sort(sum_fit$summary[,'n_eff'])/2000))
+```
+
+It appears that this model converged nicely and the effective number of 
+samples is in the right ballpark for a well-behaving model. What do our
+forecasts look like for the next 3 presidential elections? We have the
+data we need to answer this question in our generated quantities block.
+
+```{r}
+samps <- rstan::extract(fit)
+state_preds_new <- samps$y_new_pred
+dim(state_preds_new)
+```
+
+
+Here's an example of what our forecasts look like for Wyoming. We'd expect
+this state to be pretty firm Republican firewall state. 
+
+```{r}
+st_map <- unique(past_votes[,c('state','state_ind')])
+st_map %>% filter(state == 'WY') -> wy_ind
+```
+
+```{r}
+year_vec <- c(sort(unique(past_votes$year)),2020,2024,2028)
+wy_preds <- state_preds_new[,,wy_ind$state_ind]
+wy_df <- data.frame(year = year_vec,
+                    y = t(wy_preds))
+
+wy_melt <- melt(wy_df,id.vars = 'year')
+head(wy_melt)
+ggplot(wy_melt, aes(x = year, y = value, group = variable)) +
+  geom_line(alpha = 0.03) + geom_hline(yintercept = 0.5, colour = 'red') +
+  scale_x_continuous(breaks=year_vec) +
+  theme_bw() +
+  labs(title = 'Posterior draws for Wyoming Republican vote share') +
+       xlab('Year') + 
+       ylab('Republican share of two-party vote')
+```
+
+This comports with our intuition that Wyoming should be firmly Republican in 2020. The 
+model's posterior mass on a Democratic win in Wyoming in 2020 is less than 0.1 percent:
+
+
+```{r}
+dem_win_wy <- data.frame(year = year_vec, 
+                         pct_prob_dem_win = round(100*apply(wy_preds < 0.5,2,mean),2))
+dem_win_wy %>% filter(year > 2016)
+```
+
+```{r}
+l_df <- list()
+for (i in 1:50) {
+  st_nm <- st_map %>% filter(state_ind == i) 
+  st_df <- state_preds_new[,,i]
+  preds <- data.frame(year = year_vec, 
+                      y = t(st_df))
+  preds_melt <- melt(preds, id.vars = 'year')
+  preds_melt$state = st_nm$state
+  l_df[[i]] <- preds_melt
+}
+l_df <- bind_rows(l_df)
+l_df <- l_df %>% left_join(state_region_map, by = 'state')
+plts <- list()
+for (nm_i in seq_along(region_names)) {
+  region_nm <- region_names[nm_i] 
+  plts[[region_nm]] <- l_df %>% filter(region == region_nm) %>%
+    ggplot(aes(x = year, y = value, group = variable)) +
+    geom_line(alpha = 0.03) + geom_hline(yintercept = 0.5, colour = 'red') +
+    scale_x_continuous(breaks=year_vec) +
+    theme_bw() + 
+    labs(title = paste0('Republican vote share in ',region_nm,' region')) +
+         xlab('Year') + 
+         ylab('Republican share of two-party vote') + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+   facet_wrap(~ state)
+}
+```
+
+Here're the forecasts for New England's states:
+
+```{r}
+plts[['New England']]
+```
+
+Here're the forecasts for the Mid-Atlantic states:
+
+```{r}
+plts[['Mid-Atlantic']]
+```
+
+And Midwest states:
+
+```{r}
+plts[['Midwest']]
+```
+
+Making our way further west, West Coast states:
+
+```{r}
+plts[['West Coast']]
+```
+
+A southernly move:
+
+```{r}
+plts[['Southwest']]
+```
+
+And onward to the Plains region:
+
+```{r}
+plts[['Plains']]
+```
+
+Southern states:
+
+```{r}
+plts[['Border South']]
+```
+
+More Southern states:
+
+```{r}
+plts[['Outer South']]
+```
+
+Southern hospitality:
+
+```{r}
+plts[['Deep South']]
+```
+
+Mountains!:
+
+```{r}
+plts[['Mountain West']]
+```
