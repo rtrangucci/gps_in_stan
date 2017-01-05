@@ -1,26 +1,780 @@
 ---
-title: "Hierarchical Gaussian Processes in Stan"
-author: Rob Trangucci based on Andrew Gelman's blog post
+title: "Gaussian Processes in Stan"
+author: "Rob Trangucci"
 output:
   pdf_document: default
-  html_notebook: default
   html_document: default
+bibliography: bib_inf_priors.bib
 ---
 
-After a full month straight of modeling 2016 election data in \texttt{Stan} and
-\texttt{rstanarm} I'd rather do some forecasting! That seems sunnier to me.
-
-Andrew hosted this on his blog recently; a newpaper had asked some researchers
-if they would forecast the 2020, 2024 and 2028 state-wide presidential votes. As
-absurd as this sounds, let's dive into the problem, and see how we can use GPs in
-rstan can attack this problem.
-
-```{r load_packages, results="hide", message=FALSE}
+```{r load_packages, results="hide", message=FALSE, echo=FALSE}
 library(dplyr)
 library(ggplot2)
 library(rstan)
 library(reshape2)
+library(printr)
+set.seed(123)
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
 ```
+
+\section{Introduction}
+
+Stan's library has been expanded with functions that facilitate adding Gaussian processes (GPs)
+to Stan models. I'm going to share best practices for coding GPs in Stan, and
+how we can include GPs as one component of a larger model.
+
+\subsection{Gaussian processes regression}
+
+Suppose we have N observations of univariate data, $y$, each associated with scalar $x$. 
+
+The generative model for a Gaussian process regression is as follows:
+
+\begin{align*}
+  \theta & \sim g(\phi) \\
+  f(x) & \sim \text{GP}\left( \mu(x),
+  k_\theta(x) \right) \\
+  y_i & \sim \mathcal{N}\left( f(x_i), \sigma \right) \forall i
+\end{align*}
+
+A GP is a stochastic process. For our purposes we will index this process by $x 
+\in \mathbb{R}$. Any finite sample realized from this stochastic process is 
+jointly multivariate normal [@cramer2004stationary]. $\mu(x)$ is the mean of 
+$f(x)$, and $k_\theta(x)$, a kernel, defines the covariance between any
+two evaluations of $f(x)$:
+
+\begin{align*}
+\text{cov}(f(x_i),f(x_j)) = k(x_i, x_j | \theta)
+\end{align*}
+
+The kernel $k$ is parameterized by a vector $\theta$, and is required
+to a be a positive-semidefinite function [@rasmussen2005gaussian].
+
+The finite-dimensional generative model for the GP is:
+
+\begin{align*}
+\theta & \sim g(\phi) \\
+f & \sim \text{MultiNormal}(0, K_{\theta}(x)) \\
+y_i & \sim \text{Normal}(f_i, \sigma) \, \forall i \in \{1,\dots,N\}
+\end{align*}
+
+Above, $K_{\theta}(x)$ is an $N \times N$ covariance matrix, where each entry 
+$K[i, j] = k(x_i, x_j | \theta)$. We'll use the exponentiated quadratic kernel 
+to generate our covariance matrix, which has two components to theta, $\alpha$, 
+the marginal standard deviation of the stochastic process $f$ and $\ell$, the
+process length-scale.
+
+\begin{align}
+  k(x_i, x_j | \theta) = \alpha^2 
+\exp \left(
+	- \dfrac{1}{2\ell^2} (x_{i} - x_{j})^2
+\right)
+\end{align}
+
+This kernel's defining quality is its smoothness; the function is infinitely 
+differentiable. This can sometimes be unrealistic for applied work, but it will 
+suffice for our examples, as it happens to be the only covariance function that 
+has been implemented in the Stan library right now. 
+
+\section{Example: GP with normal outcome}
+
+\subsection{Latent variable formulation}
+
+We can define the Stan program for the generative model exactly as it is above
+(of course, choosing priors for $\ell$ and $\alpha$).
+
+```{r engine='cat', engine.opts = list(file = "simple_latent_gp.stan", lang = "stan")}
+functions {
+  vector gp_pred_rng(real[] x_pred,
+                     vector y_is,
+                     real[] x_is,
+                     real alpha,
+                     real length_scale,
+                     real sigma) {
+    vector[size(x_pred)] f_pred;
+    int N_pred;
+    int N;
+    N_pred = size(x_pred);
+    N = rows(y_is);
+
+    {
+      matrix[N, N] L_Sigma;
+      vector[N] K_div_y_is;
+      matrix[N, N_pred] k_x_is_x_pred;
+      matrix[N, N_pred] v_pred;
+      vector[N_pred] f_pred_mu;
+      matrix[N_pred, N_pred] cov_f_pred;
+      matrix[N_pred, N_pred] nug_pred;
+      matrix[N, N] Sigma;
+      Sigma = cov_exp_quad(x_is, alpha, length_scale);
+      for (n in 1:N)
+        Sigma[n, n] = Sigma[n,n] + square(sigma);
+      L_Sigma = cholesky_decompose(Sigma);
+      K_div_y_is = mdivide_left_tri_low(L_Sigma, y_is);
+      K_div_y_is = mdivide_right_tri_low(K_div_y_is',L_Sigma)';
+      k_x_is_x_pred = cov_exp_quad(x_is, x_pred, alpha, length_scale);
+      f_pred_mu = (k_x_is_x_pred' * K_div_y_is); 
+      v_pred = mdivide_left_tri_low(L_Sigma, k_x_is_x_pred);
+      cov_f_pred = cov_exp_quad(x_pred, alpha, length_scale) - v_pred' * v_pred;
+      nug_pred = diag_matrix(rep_vector(1e-12,N_pred));
+
+      f_pred = multi_normal_rng(f_pred_mu, cov_f_pred + nug_pred);
+    }
+    return f_pred;
+  }
+}
+data {
+  int<lower=1> N;
+  int<lower=1> N_pred;
+  vector[N] y;
+  real x[N];
+  real x_pred[N_pred];
+}
+parameters {
+  real<lower=0> length_scale;
+  real<lower=0> alpha;
+  real<lower=0> sigma;
+  vector[N] eta;
+}
+transformed parameters {
+  vector[N] f;
+  {
+    matrix[N, N] L;
+    matrix[N, N] K;
+    K = cov_exp_quad(x, alpha, length_scale);
+    for (n in 1:N)
+      K[n, n] = K[n, n] + 1e-12;
+    L = cholesky_decompose(K);
+    f = L * eta;
+  }
+}
+model {
+  length_scale ~ normal(0, 1);
+  alpha ~ normal(0, 1);
+  sigma ~ normal(0, 1);
+  eta ~ normal(0, 1);
+  y ~ normal(f, sigma);
+}
+generated quantities {
+  vector[N_pred] f_pred;
+  vector[N_pred] y_pred;
+
+  f_pred = gp_pred_rng(x_pred, y, x, alpha, length_scale, sigma);
+  for (n in 1:N_pred)
+    y_pred[n] = normal_rng(f_pred[n], sigma);
+}
+```
+
+Several details of the Stan program are important to note. First is the 
+generation of the covariance matrix from an exponentiated quadratic kernel. The 
+function \texttt{cov\_exp\_quad} will generate an $N \times N$ covariance matrix
+if given a length-$N$ array of either reals or vectors, the signal standard
+deviation, $\alpha$, and the length-scale $\ell$.
+
+The second detail is the small positive number we've added on the diagonal. In 
+this case it is 1e-12. Because we're using a positive-definite function $k$ to 
+build a covariance matrix, the resulting matrix will theoretically be positive 
+definite. However, because we're dealing with floating-point numbers, we often 
+will get matrices that should be positive definite, but are not numerically 
+positive definite. In that case, we need to force the matrix to be positive 
+definite by adding a small bit of noise to the diagonal called jitter. This
+will conflict with the parameter $\sigma$. This is OK for our purposes, as the
+amount of noise we've added is quite small compared to the scale of $\sigma$. In
+most real-world settings where we have noisy observations from a GP, the scale
+of the jitter will be small compared to the noise.
+
+The third detail is that we've taken the covariance matrix $K$ and decomposed
+the matrix using \texttt{cholesky\_decompose}. In any applied application, the
+finite dimensional sample from a GP is ultimately a multivariate normal with a
+parameterized covariance matrix. As such, we'll either need to invert the
+matrix, or decompose it in some way to add a multivariate normal density to our
+log-posterior density. It turns out that the Cholesky decomposition is the best
+way to decompose that matrix in Stan right now.
+
+We could have taken our Cholesky factor $L$ of the covariance matrix $K$ above 
+and used the function \texttt{multi\_normal\_cholesky} to add a multivariate 
+normal density over $f$ to the log-posterior. Instead, the fourth detail to note
+above is that we've multiplied the Cholesky factor of the covariance matrix by a
+vector of univariate normals $eta$ in order to generate a multivariate normal 
+density for $f$. This is due to the familiar identity. Suppose we have a 
+covariance matrix, $\Sigma$. Because it is a proper covariance matrix, there 
+exists a lower-triangular matrix $L$ such that $L \times L^T = \Sigma$. We know
+that:
+
+\begin{align*}
+\eta_i & \sim \text{Normal}(0, 1) \, \forall i \in \{1,\dots,N\} \\
+f & = L \eta \\
+f & \sim \text{MultiNormal}(0, \Sigma) 
+\end{align*}
+
+The reason to express $f$ as a \texttt{transformed\_parameter} is because it 
+removes the prior dependence of the density of $f$ on $\alpha$ and $\ell$. When
+the data are weakly informative about the $f$, this can aid in sampling
+efficiently from the joint posterior. See the section in the Stan manual on
+Neal's funnel density for the full explanation of the univariate analogue
+[@stanmanual]. As with any Stan program, we should generate some fake data from
+a model with fixed parameters and see whether we can recover our parameters.
+
+```{r engine='cat', engine.opts = list(file = "sim_gp_latent.stan", lang = "stan")}
+data {
+  int<lower=1> N;
+  real<lower=0> length_scale;
+  real<lower=0> alpha;
+  real<lower=0> sigma;
+}
+transformed data {
+  vector[N] zeros;
+  zeros = rep_vector(0, N);
+}
+model {}
+generated quantities {
+  real x[N];
+  vector[N] y;
+  vector[N] f;
+  for (n in 1:N)
+    x[n] = uniform_rng(-2,2);
+  {
+    matrix[N, N] cov;
+    matrix[N, N] L_cov;
+    cov = cov_exp_quad(x, alpha, length_scale);
+    for (n in 1:N)
+      cov[n, n] = cov[n, n] + 1e-12;
+    L_cov = cholesky_decompose(cov);
+    f = multi_normal_cholesky_rng(zeros, L_cov);
+  }
+  for (n in 1:N)
+    y[n] = normal_rng(f[n], sigma);
+}
+```
+
+```{r, results="hide", message=FALSE, echo=FALSE}
+sim_data_model <- stan_model('sim_gp_latent.stan')
+```
+
+```{r}
+dat_list <- list(N = 2000, alpha = 1, length_scale = 0.15, sigma = sqrt(0.1))
+set <- sample(1:dat_list$N,size = 30, replace = F)
+draw <- sampling(sim_data_model,iter=1,algorithm='Fixed_param', chains = 1, data = dat_list,
+                 seed = 363360090)
+samps <- rstan::extract(draw)
+plt_df = with(samps,data.frame(x = x[1,], y = y[1,], f = f[1,]))
+```
+
+Here's the data below:
+
+```{r}
+ggplot(data = plt_df[set,], aes(x=x, y=y)) + 
+  geom_point(aes(colour = 'Realized data')) + 
+  geom_line(data = plt_df, aes(x = x, y = f, colour = 'Latent mean function')) +
+   theme_bw() + theme(legend.position="bottom") +
+  scale_color_manual(name = '', values = c('Realized data'='black','Latent mean function'='red')) +
+  xlab('X') + 
+  ylab('y') +
+  ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
+```
+
+We prep the data for modeling and inference in Stan:
+
+```{r}
+stan_data <- list(N = length(set), N_pred = dat_list$N - length(set),
+                  zeros =rep(0,length(set)), x = samps$x[1,set], y = samps$y[1,set],
+                  x_pred = samps$x[1,-set], f_pred = samps$f[1,-set])
+```
+
+And run Stan.
+
+```{r, results="hide", message=FALSE, echo=FALSE}
+comp_gp_mod_lat <- stan_model('simple_latent_gp.stan')
+```
+
+```{r, cache=TRUE}
+gp_mod_lat <- sampling(comp_gp_mod_lat, data = stan_data, cores = 4, chains = 4, iter = 2000, control = list(adapt_delta = 0.95))
+samps_gp_mod_lat <- extract(gp_mod_lat)
+plt_df_rt = data.frame(x = stan_data$x_pred, f = t(samps_gp_mod_lat$f_pred))
+plt_df_rt_melt = melt(plt_df_rt,id.vars = 'x')
+p <- ggplot(data = plt_df[set,], aes(x=x, y=y)) + 
+  geom_line(data = plt_df_rt_melt, aes(x = x, y = value, group = variable, colour = 'Posterior mean functions'), alpha = 0.15) + theme_bw() + theme(legend.position="bottom") +
+  geom_point(aes(colour = 'Realized data')) + 
+  geom_line(data = plt_df, aes(x = x, y = f, colour = 'Latent mean function')) +
+   theme_bw() + theme(legend.position="bottom") +
+  scale_color_manual(name = '', values = c('Realized data'='black','Latent mean function'='red','Posterior mean functions'= 'blue')) +
+  xlab('X') + 
+  ylab('y') +
+  ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
+p
+```
+
+How does the model do at capturing out-of-sample data? One way to do examine the model's
+use in quantifying the uncertainty in predicting out-of-sample data is to measure how many
+out-of-sample data points fall into a certain posterior predictive interval. To that end,
+let's quantify the 50\% and the 95\% posterior predictive intervals generated by our model
+in the generated quantities block, \texttt{y\_pred}. 
+
+```{r}
+ppc_interval_df <- function(yrep, y) {
+  q_95 <- apply(yrep,2,quantile,0.95)
+  q_75 <- apply(yrep,2,quantile,0.75)
+  q_50 <- apply(yrep,2,median)
+  q_25 <- apply(yrep,2,quantile,0.25)
+  q_05 <- apply(yrep,2,quantile,0.05)
+  mu <- colMeans(yrep)
+  df_post_pred <- data.frame(y_obs = y,
+                             q_95 = q_95,
+                             q_75 = q_75,
+                             q_50 = q_50,
+                             q_25 = q_25,
+                             q_05 = q_05,
+                             mu = mu)
+  return(df_post_pred)
+}
+interval_cover <- function(upper, lower, elements) {
+  return(mean(upper >= elements & lower <= elements))
+}
+```
+
+```{r}
+ppc_full_bayes <- ppc_interval_df(samps_gp_mod_lat$y_pred, samps$y[1,-set])
+```
+
+`r round(100*interval_cover(ppc_full_bayes$q_95,ppc_full_bayes$q_05, ppc_full_bayes$y_obs))`\% 
+of out-of-sample data points are in the 90\% posterior predictive interval.
+
+`r round(100*interval_cover(ppc_full_bayes$q_75,ppc_full_bayes$q_25, ppc_full_bayes$y_obs))`\%
+of out-of-sample data points are in the central 50\% posterior predictive interval.
+
+We can also get a posterior distribution over our RMSE for out-of-sample data.
+We define a function called \texttt{ppc\_rmse} that returns draws from the RMSE
+for a set of out-of-sample predictions.
+
+```{r}
+ppc_rmse <- function(yrep, y) {
+  rmse_vec <- sqrt(colMeans(sweep(yrep, MARGIN=2, STATS = y)^2))
+}
+ppc_mae <- function(yrep, y) {
+  rmse_vec <- colMeans(abs(sweep(yrep, MARGIN=2, STATS = y)))
+}
+rmse_full_bayes <- ppc_rmse(samps_gp_mod_lat$y_pred, samps$y[1,-set])
+mae_full_bayes <- ppc_mae(samps_gp_mod_lat$y_pred, samps$y[1,-set])
+```
+
+We'll also check the posterior samples for our unknown hyperparameters, $\ell$, $\sigma$, and $\alpha$.
+
+```{r, message=FALSE}
+df1 <- data.frame(x = samps_gp_mod_lat$alpha)
+p1 <- ggplot(data = df1, 
+             aes(x = x)) + geom_histogram() + theme_bw() +
+  labs(title = 'Posterior draws of alpha') +
+       xlab('Alpha') + geom_vline(xintercept = dat_list$alpha,colour = 'red')
+df2 <- data.frame(x = samps_gp_mod_lat$length_scale)
+p2 <- ggplot(data = df2, 
+             aes(x = x)) + geom_histogram() + theme_bw() +
+  labs(title = 'Posterior draws of length-scale') +
+       xlab('Length-scale') + geom_vline(xintercept = dat_list$length_scale,colour = 'red')
+
+df3 <- data.frame(x = samps_gp_mod_lat$sigma)
+p3 <- ggplot(data = df3, 
+             aes(x = x)) + geom_histogram() + theme_bw() +
+  labs(title = 'Posterior draws of sigma') + 
+        geom_vline(xintercept = dat_list$sigma,colour = 'red') + xlab('Sigma')
+
+multiplot(p1, p2, p3, cols = 3)
+```
+
+All three of the known parameters lie in areas of large posterior mass.
+
+\subsection{To marginalize or to maximize?}
+
+We've taken it for granted that we want to marginalize over the hyperparameters 
+rather than using a frequentist solution like is so often advocated in the 
+literature (often due to computational constraints!). Let's examine this 
+decision more closely. First, we'll take a quick diversion to learn how we can 
+reparameterize the GP with a normal outcome that will make the model more 
+computationally efficient (and make the model more amenable to penalized maximum
+likelihood estimation of the hyperparameters).
+
+\subsection{Marginal likelihood formulation}
+
+We can also express the GP with a normal likelihood like so:
+
+\begin{align}
+  p(y | \alpha, \ell, \sigma) = \int p(y | f, \sigma) p(f | \alpha, \ell) df
+\end{align}
+
+It turns out that $p(y | \alpha, \ell, \sigma)$ is multivariate normal with with
+a covariance matrix parameterized by a new kernel that integrates the noise
+$\sigma$ with the exponentiated quadratic:
+
+\begin{align}
+  k(x_i, x_j | \theta) = \alpha^2 
+\exp \left(
+	- \dfrac{1}{2\ell^2} (x_{i} - x_{j})^2
+\right) + \delta_{ij} \sigma^2
+\end{align}
+
+Above, $\delta_{ij}$ is the Dirac delta function, taking the value of 1 when $i = j$ and
+remaining zero otherwise.
+
+Thus, the generative model is now:
+
+\begin{align}
+\ell & \sim \text{Gamma}(2,2) \\
+\alpha & \sim \text{Half-Normal}(0, 1) \\
+\sigma & \sim \text{Half-Normal}(0, 1) \\
+\mathbf{y} & \sim \text{MultiNormal}(0, K_{\ell,\alpha}(\mathbf{x},\mathbf{x}) + \sigma^2 I_n) \\
+&            \mathbf{y}, \mathbf{x} \in \mathbb{R}^N
+\end{align}
+
+Note that this is a much lower-dimensional representation of a GP. It takes us from a
+$N + 3$ dimensional parameter space to a 3-dimensional parameter space. This will
+reduce the memory requirements substantially for our inference on the hyperparameters, as 
+well as decreasing the dimension of the gradients.
+
+We would code that up in Stan as follows, omitting the function block and the generated 
+quantities block:
+
+
+```{r engine='cat', engine.opts = list(file = "simple_marginal_gp.stan", lang = "stan")}
+data {
+  int<lower=1> N;
+  int<lower=1> N_pred;
+  vector[N] y;
+  real x[N];
+  real x_pred[N_pred];
+}
+transformed data {
+  vector[N] zeros;
+  
+  zeros = rep_vector(0, N);
+} 
+parameters {
+  real<lower=0> length_scale;
+  real<lower=0> alpha;
+  real<lower=0> sigma;
+}
+model {
+  matrix[N, N] L_cov;
+  {
+    matrix[N, N] cov;
+    cov = cov_exp_quad(x, alpha, length_scale);
+    for (n in 1:N)
+      cov[n, n] = cov[n, n] + square(sigma);
+    L_cov = cholesky_decompose(cov);
+  }
+  length_scale ~ normal(0, 1);
+  alpha ~ normal(0, 1);
+  sigma ~ normal(0, 1);
+  y ~ multi_normal_cholesky(zeros, L_cov);
+}
+```
+
+Let's find the penalized MLEs for $\alpha$, $\delta$, and $\ell$. We can do this
+easily in RStan by calling \texttt{optimizing} on the compiled model.
+
+```{r, results="hide", message=FALSE, echo=FALSE}
+marg_model <- stan_model('simple_marginal_gp.stan')
+```
+
+```{r, results="hide", message=FALSE}
+marg_model_opt <- optimizing(marg_model, data = stan_data)
+```
+
+```{r}
+marg_model_opt$par
+```
+
+We can see that these estimates are biased a bit, but this is to be expected 
+because we have a finite sample of data and priors on the hyperparameters.
+
+```{r}
+stan_data_marg <- stan_data
+stan_data_marg$length_scale = marg_model_opt$par['length_scale']
+stan_data_marg$alpha = marg_model_opt$par['alpha']
+stan_data_marg$sigma = marg_model_opt$par['sigma']
+```
+
+
+```{r engine='cat', engine.opts = list(file = "simple_marginal_gp_sim.stan", lang = "stan")}
+functions {
+  vector gp_pred_rng(real[] x_pred,
+                     vector y_is,
+                     real[] x_is,
+                     real alpha,
+                     real length_scale,
+                     real sigma) {
+    vector[size(x_pred)] f_pred;
+    int N_pred;
+    int N;
+    N_pred = size(x_pred);
+    N = rows(y_is);
+
+    {
+      matrix[N, N] L_Sigma;
+      vector[N] K_div_y_is;
+      matrix[N, N_pred] k_x_is_x_pred;
+      matrix[N, N_pred] v_pred;
+      vector[N_pred] f_pred_mu;
+      matrix[N_pred, N_pred] cov_f_pred;
+      matrix[N_pred, N_pred] nug_pred;
+      matrix[N, N] Sigma;
+      Sigma = cov_exp_quad(x_is, alpha, length_scale);
+      for (n in 1:N)
+        Sigma[n, n] = Sigma[n,n] + square(sigma);
+      L_Sigma = cholesky_decompose(Sigma);
+      K_div_y_is = mdivide_left_tri_low(L_Sigma, y_is);
+      K_div_y_is = mdivide_right_tri_low(K_div_y_is',L_Sigma)';
+      k_x_is_x_pred = cov_exp_quad(x_is, x_pred, alpha, length_scale);
+      f_pred_mu = (k_x_is_x_pred' * K_div_y_is); 
+      v_pred = mdivide_left_tri_low(L_Sigma, k_x_is_x_pred);
+      cov_f_pred = cov_exp_quad(x_pred, alpha, length_scale) - v_pred' * v_pred;
+      nug_pred = diag_matrix(rep_vector(1e-12,N_pred));
+
+      f_pred = multi_normal_rng(f_pred_mu, cov_f_pred + nug_pred);
+    }
+    return f_pred;
+  }
+}
+data {
+  int<lower=1> N;
+  int<lower=1> N_pred;
+  vector[N] y;
+  real x[N];
+  real x_pred[N_pred];
+  real<lower=0> sigma;
+  real<lower=0> length_scale;
+  real<lower=0> alpha;
+}
+model {
+}
+generated quantities {
+  vector[N_pred] f_pred;
+  vector[N_pred] y_pred;
+
+  f_pred = gp_pred_rng(x_pred, y, x, alpha, length_scale, sigma);
+  for (n in 1:N_pred)
+    y_pred[n] = normal_rng(f_pred[n], sigma);
+}
+```
+
+```{r, results="hide", message=FALSE, echo=FALSE}
+marg_model_sim <- stan_model('simple_marginal_gp_sim.stan')
+marg_draws <- sampling(marg_model_sim,iter=2000,algorithm='Fixed_param',
+                 chains = 1,data = stan_data_marg)
+```
+
+```{r, results ="hide", message=FALSE}
+samps_marg <- rstan::extract(marg_draws)
+ppc_max_marg <- ppc_interval_df(samps_marg$y_pred, samps$y[1,-set])
+```
+
+`r round(100*interval_cover(ppc_max_marg$q_95,ppc_max_marg$q_05, ppc_max_marg$y_obs))`\%
+of out-of-sample data points are in the 90\% posterior predictive interval.
+
+`r round(100*interval_cover(ppc_max_marg$q_75,ppc_max_marg$q_25, ppc_max_marg$y_obs))`\% 
+of out-of-sample data points are in the 90\% posterior predictive interval.
+
+Like above, we can calculate RMSE for our mean predictions.
+
+```{r}
+rmse_max_marg <- ppc_rmse(samps_marg$y_pred, samps$y[1,-set])
+mae_max_marg <- ppc_mae(samps_marg$y_pred, samps$y[1,-set])
+```
+
+The mean of the distribution of the RMSE for the penalized maximum marginal likelihood
+is lower than the rmse of the full Bayesian estimation. 
+
+```{r}
+ppc_max_marg$x <- samps$x[1,-set]
+ggplot(data = ppc_max_marg, aes(x = x, y = y_obs)) +
+  geom_ribbon(aes(ymax = q_95, ymin = q_05,alpha=0.5, colour = '95% predictive interval')) + geom_point(aes(colour = 'Out-of-sample data'),alpha=0.5) + theme_bw() +
+  geom_point(data = plt_df[set,], aes(x = x, y = y, colour='Observed data')) + theme(legend.position="bottom") +
+  scale_color_manual(name = '', values = c('Observed data'='red',
+                                           '95% predictive interval'='blue',
+                                           'Out-of-sample data'= 'black')) +
+  xlab('X') + 
+  ylab('y') +
+  ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
+```
+
+```{r}
+ppc_full_bayes$x <- samps$x[1,-set]
+ggplot(data = ppc_full_bayes, aes(x = x, y = y_obs)) +
+  geom_ribbon(aes(ymax = q_95, ymin = q_05,alpha=0.5, colour = '95% predictive interval')) + geom_point(aes(colour = 'Out-of-sample data'),alpha=0.5) + theme_bw() +
+  geom_point(data = plt_df[set,], aes(x = x, y = y, colour='Observed data')) + theme(legend.position="bottom") +
+  scale_color_manual(name = '', values = c('Observed data'='red',
+                                           '95% predictive interval'='blue',
+                                           'Out-of-sample data'= 'black')) +
+  xlab('X') + 
+  ylab('y') +
+  ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
+```
+  
+\section{GP with Poisson outcome}
+
+Let's say we have count data now, and we want to fit the data using a GP 
+prior for the latent mean. 
+
+The generative model for the data will be nearly identical to our normal latent
+variable model:
+
+\begin{align*}
+\theta & \sim g(\phi) \\
+f & \sim \text{MultiNormal}(0, K_{\theta}(x)) \\
+y_i & \sim \text{Poisson}(\exp(f_i)) \, \forall i \in \{1,\dots,N\}
+\end{align*}
+
+Luckily, we can reuse much of our code from the normal latent variable model
+while removing the $\sigma$ parameter and changing our likelihood to a 
+Poisson with a $\log$ link.
+
+
+```{r engine='cat', engine.opts = list(file = "pois_latent_gp.stan", lang = "stan")}
+data {
+  int<lower=1> N;
+  int<lower=1> N_pred;
+  int y[N];
+  real x[N];
+  real x_pred[N_pred];
+}
+transformed data {
+  int<lower=1> N_tot;
+  int<lower=1> k;
+  real x_tot[N_pred + N];
+  
+  N_tot = N_pred + N;
+  k = 1;
+  for (n in 1:N) {
+    x_tot[k] = x[n];
+    k = k + 1;
+  }
+  for (n in 1:N_pred) {
+    x_tot[k] = x_pred[n];
+    k = k + 1;
+  }
+}
+parameters {
+  real<lower=0> length_scale;
+  real<lower=0> alpha;
+  vector[N_tot] eta;
+}
+transformed parameters {
+  vector[N_tot] f;
+  {
+    matrix[N_tot, N_tot] L;
+    matrix[N_tot, N_tot] K;
+    K = cov_exp_quad(x_tot, alpha, length_scale);
+    for (n in 1:N_tot)
+      K[n, n] = K[n, n] + 1e-12;
+    L = cholesky_decompose(K);
+    f = L * eta;
+  }
+}
+model {
+  length_scale ~ normal(0, 1);
+  alpha ~ normal(0, 1);
+  eta ~ normal(0, 1);
+  y ~ poisson_log(f[1:N]);
+}
+```
+
+We can repurpose the fake data from above, by exponentiating the $f$ and generating Poisson
+random variables conditioned on $\exp(f)$:
+
+```{r}
+pois_oos_set <- sample((1:dat_list$N)[-set],size = 150, replace = F)
+pois_N_oos <- length(pois_oos_set)
+N_set <- length(set)
+pois_full_set <- c(set,pois_oos_set)
+pois_N_full_set <- pois_N_oos + N_set
+stan_data_pois <- list(N = length(set), N_pred = pois_N_oos,
+                       f_all = exp(samps$f[1,]),
+                       x = samps$x[1,set], x_all = samps$x[1,],
+                       y_all = rpois(n = dat_list$N,
+                                     lambda = exp(samps$f[1,])),
+                       x_pred = samps$x[1,pois_oos_set])
+stan_data_pois$y <- stan_data_pois$y_all[set]
+```
+
+```{r, results="hide", message=FALSE, echo=FALSE}
+gp_mod_lat_pois <- stan_model('pois_latent_gp.stan')
+```
+
+```{r, message=FALSE}
+mod_run_lat_pois <- sampling(gp_mod_lat_pois, data = stan_data_pois, cores = 2, chains = 4, iter = 1000)
+samps_lat_pois <- rstan::extract(mod_run_lat_pois)
+df1 <- data.frame(x = samps_lat_pois$alpha)
+p1 <- ggplot(data = df1, 
+             aes(x = x)) + geom_histogram() + theme_bw() +
+  labs(title = 'Posterior draws of alpha') +
+       xlab('Alpha') + geom_vline(xintercept = dat_list$alpha,colour = 'red')
+df2 <- data.frame(x = samps_lat_pois$length_scale)
+p2 <- ggplot(data = df2, 
+             aes(x = x)) + geom_histogram() + theme_bw() +
+  labs(title = 'Posterior draws of length-scale') +
+       xlab('Length-scale') + geom_vline(xintercept = dat_list$length_scale,colour = 'red')
+multiplot(p1, p2, cols = 2)
+```
+
+```{r}
+plt_df = with(stan_data_pois,data.frame(x = c(x_all[set],x_all[pois_oos_set]), 
+                                        y = c(y_all[set],y_all[pois_oos_set]),
+                                        f = c(f_all[set],f_all[pois_oos_set])))
+plt_df_rt = data.frame(x = plt_df$x, f = exp(t(samps_lat_pois$f)))
+plt_df_rt_melt = melt(plt_df_rt,id.vars = 'x')
+p <- ggplot(data = plt_df[1:length(set),], aes(x=x, y=y)) + 
+  geom_point(aes(colour = 'Realized data')) + 
+  geom_line(data = plt_df_rt_melt, aes(x = x, y = value, group = variable, colour = 'Posterior mean functions'), alpha = 0.05) + theme_bw() + theme(legend.position="bottom") +
+  geom_line(data = plt_df, aes(x = x, y = f, colour = 'Latent mean function')) +
+  scale_color_manual(name = '', values = c('Realized data'='black','Latent mean function'='red', 'Posterior mean functions'='blue')) +
+  xlab('X') + 
+  ylab('y') +
+  ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
+p
+```
+
+\section{GP example}
+
+After a full month straight of modeling 2016 election data in \texttt{Stan} and 
+\texttt{rstanarm} let's do some forecasting rather than backwards-looking analysis.
+
+Andrew hosted this on his blog recently; the NYTimes had asked some researchers
+if they would forecast the 2020, 2024 and 2028 state-wide presidential votes. As
+absurd as this sounds, let's dive into the problem, and see how we can use GPs in
+Stan to generate forecasts. Much of the code I'll present below was featured on
+Andrew's blog, and the model we'll walk through is a slight variation on what
+he fitted.
 
 Let's load the data:
 
@@ -29,19 +783,22 @@ past_votes <- readRDS('data_pres_forecast/pres_vote_historical.RDS') %>%
   filter(state != 'DC')
 ```
 
-We're going to exclude DC because it's so different from the other states. We
-don't necessarily want to have DC impact our estimates for other states because
-it'll affect our hierarchical variance estimates.
+We're going to exclude DC because it's so different from the other states. We're 
+going to use exchangeable priors to model time-invariant state effects and time-varying
+state effects, and DC is sufficiently different from the other states that we should
+build separate priors for the nation's capital. I won't do that here because I want
+to showcase integrating GPs into a more complex model, but we certainly could do this
+in the interest of generating better and more-detailed forecasts. 
 
 ```{r}
-head(past_votes)
+past_votes %>% head()
 ```
 
 The observations are the counts of the two-party vote in each state by each
 presidential election. Let's see how many years we have to work with:
 
 ```{r}
-table(past_votes$state)
+table(past_votes$state) %>% summary()
 ```
 
 We have only 11 observations per state, which isn't very many. But perhaps there
@@ -81,15 +838,6 @@ We have 10 regions, with about 5 states per region. In order to get the data
 into the right form for Stan, we need a list of integers that map each
 observation to a state, and a separate vector for regions. 
 
-We'll also need mean turnout per year in order to properly weight the
-observations at the state level. We want to some estimate as to whether the
-state had a larger-than-average turnout compared to the average state each year.
-
-```{r}
-mean_turnout <- past_votes %>% group_by(year) %>%
-  summarise(mean_turnout = exp(mean(log(dem + rep))))
-```
-
 Joining all the data together will allow us to plot everything, which will
 elucidate the structure of the data.
 
@@ -97,16 +845,13 @@ elucidate the structure of the data.
 year_map <- data.frame(year = sort(unique(past_votes$year)),
                        year_ind = 1:11)
 past_votes <- past_votes %>%
-  left_join(mean_turnout, by = 'year') %>%
   arrange(state, year) %>%
   left_join(state_region_map, by = 'state') %>%
   left_join(year_map, by = 'year') %>%
   mutate(
     state_ind = as.integer(as.factor(state)),
     two_party_turnout = dem + rep,
-    y = rep / two_party_turnout,
-    relative_turnout = two_party_turnout / mean_turnout,
-    turnout_weight = relative_turnout^(-0.5)
+    y = rep / two_party_turnout
   )
 ```
 
@@ -120,7 +865,7 @@ head(past_votes[,c('year','state','state_ind','region','region_ind','y')])
 tail(past_votes[,c('year','state','state_ind','region','region_ind','y')])
 ```
 
-We're going to plot the time series of the Repulican share of the two-party vote
+We're going to plot the time series of the Republican share of the two-party vote
 in each state for the past 11 presidential elections.
 
 ```{r}
@@ -129,21 +874,44 @@ past_votes %>%
   geom_line() + facet_wrap(~ region) +
   theme_bw() + theme(legend.position = 'None') +
   ylab('Republican share of two-party vote') + xlab('Year')
-
 ```
 
 We can see some patterns that we might want to include in a model. Most notably,
 and perhaps not surprisingly, we see that there is a cross-sectional national
-correlation each year. There look to be time-invariate state-level mean Republican
+correlation each year. There look to be time-invariant state-level mean Republican
 shares. There's also a clustering that occurs at the region level. There should
-likely be a time-invariatne regional offset.
+likely be a time-invariant regional offset.
 
 Within regions, there is also a clear time trend. Some states don't strictly
 adhere to the regional trend. There is a longer-term trend, and then short-term
-deviations away from the trend. This suggests a model structure like so:
+deviations away from the trend. This suggests a model structure that accounts
+for time-varying and time-invariant state and regional factors, as well as national trends. 
+Our outcome data will be the Republican share of the two-party vote, so we'll use a
+beta density for our likelihood. The beta distribution has support in $[0,1]$. The beta
+distribution is canonically parameterized with two shape parameters, $\gamma$ and $\beta$.
+
+\begin{align}
+p(y | \gamma, \beta) = \dfrac{1}{\text{B}(\gamma, \beta)} 
+y ^ {\gamma - 1} (1 - y)^{\beta - 1}
+\end{align}
+
+We can reparameterize the distribution in terms of its mean $\mathbb{E}[y] = \mu$ and precision, $\text{Var}[y] = \dfrac{\mu (1 - \mu)}{(1 + \nu)}$
+[@betareg].
+
+\begin{align}
+p(y | \mu, \nu) = \dfrac{1}{\text{B}(\mu \nu, (1 - \mu) \nu)} 
+y ^ {\mu \nu - 1} (1 - y)^{(1 - \mu) \nu - 1}
+\end{align}
+
+We'll use the alternative parameterization for our regression. Note that 
+$\nu = \gamma + \beta$. We can think of $\nu$ as being the prior sample size,
+like when using a beta distribution as a conjugate prior for the probability
+parameter in a binomial likelihood. The interpretation of $\nu$ as sample size
+helps us to formulate an informative prior for $\nu$. We use a Gamma distribution
+with a mean of 500, $\nu \sim \text{Gamma}(5,\tfrac{1}{100})$.
 
 \begin{align*}
-y_{t,j} & \sim \text{Normal}(\mu_{t,j}, \sigma) \\
+y_{t,j} & \sim \text{Beta}(\text{inv\_logit} \, \mu_{t,j}, \nu) \\
 \mu_{t,j} & = \theta_t^{\text{year}} 
             + \theta_j^{\text{state}}
             + \theta_{k[j]} ^{\text{region}} \\
@@ -152,10 +920,11 @@ y_{t,j} & \sim \text{Normal}(\mu_{t,j}, \sigma) \\
 \boldsymbol{\delta_{k}} & \sim \text{MultiNormal}(0, K_{\ell^\delta_1, \alpha^\delta_1} + K_{\ell^\delta_2, \alpha^\delta_2})
 \end{align*}
 
-In order to properly identify the model, we'll need strong priors over
-all of the parameters, because we don't have very much data to work with. A quick and 
-dirty way to formulate priors that have good shrinkage properties is to put hierarchcial
-shrinkage priors on our $\theta_j^{\text{state}}$ and $\theta_{k}^{\text{region}}$:
+In order to properly identify the model, we'll need strong priors over all of
+the parameters, because we don't have very much data to work with. A quick way
+to formulate priors that have good shrinkage properties is to put hierarchical 
+shrinkage priors on our $\theta_j^{\text{state}}$ and
+$\theta_{k}^{\text{region}}$:
 
 \begin{align*}
 \theta_j^{\text{state}} & \sim \text{Normal}(0, \sigma^\text{state}) \\
@@ -163,7 +932,7 @@ shrinkage priors on our $\theta_j^{\text{state}}$ and $\theta_{k}^{\text{region}
 \end{align*}
 
 Note that we might even want to put more structure into the variance
-parameters for the state-level time-invariant means:
+parameters for the state-level time-invariant means.
 
 \begin{align*}
 \theta_j^{\text{state}} & \sim \text{Normal}(0, \sigma_{k[j]}^\text{state}) \\
@@ -179,7 +948,7 @@ stan_state_region_map <- unique(past_votes[,c('state_ind','region_ind')]) %>%
 ```
 
 ```{r}
-head(stan_state_region_map)
+stan_state_region_map %>% head()
 ```
 
 Now we prep the data for RStan:
@@ -194,15 +963,13 @@ to_stan <- with(past_votes,
                    N_years_obs = length(unique(past_votes$year)),
                    state_ind = state_ind,
                    region_ind = region_ind,
-                   turnout_weight = turnout_weight,
                    y = y,
                    year_ind = year_ind,
                    N_years = 14))
 
 ```
 
-The model is quite large, so bear with me as we walk through each of the 
-different sections.
+\subsection{Stan program for election forecasting}
 
 ```{r engine='cat', engine.opts = list(file = "hierarchical_gp.stan", lang = "stan")}
 data {
@@ -215,16 +982,17 @@ data {
   int<lower=1,upper=50> state_ind[N];
   int<lower=1,upper=10> region_ind[N];
   int<lower=1> year_ind[N];
-  vector<lower=0>[N] turnout_weight;
   vector<lower=0,upper=1>[N] y;
 }
 transformed data {
   real years[N_years];
-  vector[17] counts;
+  vector[16] counts;
+  int n_comps;
 
   for (t in 1:N_years)
     years[t] = t;
-  for (i in 1:17)
+  n_comps = rows(counts);
+  for (i in 1:n_comps)
     counts[i] = 2;
 }
 parameters {
@@ -234,9 +1002,9 @@ parameters {
   vector[N_states] state_std;
   vector[N_regions] region_std;
   real<lower=0> tot_var;
-  simplex[17] prop_var;
+  simplex[n_comps] prop_var;
   real mu;
-
+  real<lower=0> nu;
 
   real<lower=0> length_GP_region_long;
   real<lower=0> length_GP_state_long;
@@ -250,20 +1018,18 @@ transformed parameters {
   vector[N_years_obs] year_re;
   vector[N_states] state_re;
   vector[N_regions] region_re;
-  vector[17] vars;
+  vector[n_comps] vars;
 
   real sigma_year;
   real sigma_region;
   vector[10] sigma_state;
-
-  real sigma_error_state_2;
 
   real sigma_GP_region_long;
   real sigma_GP_state_long;
   real sigma_GP_region_short;
   real sigma_GP_state_short;
 
-  vars = 17 * prop_var * tot_var;
+  vars = n_comps * prop_var * tot_var;
   sigma_year = sqrt(vars[1]);
   sigma_region = sqrt(vars[2]);
   for (i in 1:10)
@@ -272,8 +1038,7 @@ transformed parameters {
   sigma_GP_region_long = sqrt(vars[13]);
   sigma_GP_state_long = sqrt(vars[14]);
   sigma_GP_region_short = sqrt(vars[15]);
-  sigma_GP_state_short = sqrt(vars[16]);
-  sigma_error_state_2 = sqrt(vars[17]);
+  sigma_GP_state_short = sqrt(vars[n_comps]);
 
   region_re = sigma_region * region_std;
   year_re = sigma_year * year_std;
@@ -308,21 +1073,22 @@ model {
   vector[N] obs_mu;
 
   for (n in 1:N) {
-    obs_mu[n] = mu + year_re[year_ind[n]] 
+    obs_mu[n] = nu * inv_logit(mu + year_re[year_ind[n]] 
               + state_re[state_ind[n]] 
               + region_re[region_ind[n]]
               + GP_region[year_ind[n],region_ind[n]]
-              + GP_state[year_ind[n],state_ind[n]];
+              + GP_state[year_ind[n],state_ind[n]]);
   }
-  y ~ normal(obs_mu, sigma_error_state_2); #* turnout_weight);
+  y ~ beta(obs_mu, (nu - obs_mu)); 
 
   to_vector(GP_region_std) ~ normal(0, 1);
   to_vector(GP_state_std) ~ normal(0, 1);
   year_std ~ normal(0, 1);
   state_std ~ normal(0, 1);
   region_std ~ normal(0, 1);
-  mu ~ normal(.5, .5);
+  mu ~ normal(0, .5);
   tot_var ~ gamma(3, 3);
+  nu ~ gamma(5, 0.01);
   prop_var ~ dirichlet(counts);
   length_GP_region_long ~ weibull(30,8);
   length_GP_state_long ~ weibull(30,8);
@@ -335,7 +1101,7 @@ generated quantities {
 
   {
     real level;
-    level = normal_rng(0.5, sigma_year);
+    level = normal_rng(0.0, sigma_year);
     for (state in 1:N_states) {
       for (t in 1:N_years) {
         if (t < 12) {
@@ -351,17 +1117,21 @@ generated quantities {
                          + GP_region[t,state_region_ind[state]]
                          + level;
         }
-        y_new_pred[t,state] = normal_rng(y_new[t,state],
-                                         sigma_error_state_2);
+        y_new_pred[t,state] =
+          beta_rng(inv_logit(y_new[t,state]) * nu,
+                   nu * (1 - inv_logit(y_new[t,state])));
       }
     }
   }
 }
 ```
 
-```{r}
+```{r, results="hide", message=FALSE}
 compiled_model <- stan_model("hierarchical_gp.stan")
-fit <- sampling(compiled_model, data = to_stan, iter = 1000,
+```
+
+```{r, cache=TRUE}
+fit <- sampling(compiled_model, data = to_stan, iter = 2000,
                 chains = 4, cores = 2, seed = 1245860998)
 ```
 
@@ -370,11 +1140,11 @@ Let's inspect the results for convergence of parameters.
 ```{r}
 sum_fit <- summary(fit)
 tail(sort(sum_fit$summary[,'Rhat']))
-head(round(100*sort(sum_fit$summary[,'n_eff'])/2000))
+head(round(100*sort(sum_fit$summary[,'n_eff'])/max(sum_fit$summary[,'n_eff'])))
 ```
 
 It appears that this model converged nicely and the effective number of 
-samples is in the right ballpark for a well-behaving model. What do our
+samples is in the right ballpark for a well-behaved model. What do our
 forecasts look like for the next 3 presidential elections? We have the
 data we need to answer this question in our generated quantities block.
 
@@ -386,7 +1156,7 @@ dim(state_preds_new)
 
 
 Here's an example of what our forecasts look like for Wyoming. We'd expect
-this state to be pretty firm Republican firewall state. 
+this state to be a pretty firm Republican firewall state. 
 
 ```{r}
 st_map <- unique(past_votes[,c('state','state_ind')])
@@ -411,7 +1181,7 @@ ggplot(wy_melt, aes(x = year, y = value, group = variable)) +
 ```
 
 This comports with our intuition that Wyoming should be firmly Republican in 2020. The 
-model's posterior mass on a Democratic win in Wyoming in 2020 is less than 0.1 percent:
+model's posterior mass on a Democratic win in Wyoming in 2020 is less than half a percent:
 
 
 ```{r}
@@ -473,7 +1243,7 @@ Making our way further west, West Coast states:
 plts[['West Coast']]
 ```
 
-A southernly move:
+A southerly move:
 
 ```{r}
 plts[['Southwest']]
@@ -497,14 +1267,16 @@ More Southern states:
 plts[['Outer South']]
 ```
 
-Southern hospitality:
+The Deep South:
 
 ```{r}
 plts[['Deep South']]
 ```
 
-Mountains!:
+And, finally, the Mountain West:
 
 ```{r}
 plts[['Mountain West']]
 ```
+
+# REFERENCES
