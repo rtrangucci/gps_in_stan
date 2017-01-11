@@ -182,7 +182,7 @@ transformed parameters {
   }
 }
 model {
-  length_scale ~ normal(0, 1);
+  length_scale ~ gamma(2, 20);
   alpha ~ normal(0, 1);
   sigma ~ normal(0, 1);
   eta ~ normal(0, 1);
@@ -323,14 +323,17 @@ comp_gp_mod_lat <- stan_model('simple_latent_gp.stan')
 ```{r, cache=TRUE}
 gp_mod_lat <- sampling(comp_gp_mod_lat, data = stan_data, cores = 4, chains = 4, iter = 2000, control = list(adapt_delta = 0.95))
 samps_gp_mod_lat <- extract(gp_mod_lat)
+post_pred <- data.frame(x = stan_data$x_pred,
+                        pred_mu = colMeans(samps_gp_mod_lat$f_pred))
 plt_df_rt = data.frame(x = stan_data$x_pred, f = t(samps_gp_mod_lat$f_pred))
 plt_df_rt_melt = melt(plt_df_rt,id.vars = 'x')
 p <- ggplot(data = plt_df[set,], aes(x=x, y=y)) + 
   geom_line(data = plt_df_rt_melt, aes(x = x, y = value, group = variable, colour = 'Posterior mean functions'), alpha = 0.15) + theme_bw() + theme(legend.position="bottom") +
   geom_point(aes(colour = 'Realized data')) + 
   geom_line(data = plt_df, aes(x = x, y = f, colour = 'Latent mean function')) +
+  geom_line(data = post_pred, aes(x = x, y = pred_mu, colour = 'Posterior mean function')) +
    theme_bw() + theme(legend.position="bottom") +
-  scale_color_manual(name = '', values = c('Realized data'='black','Latent mean function'='red','Posterior mean functions'= 'blue')) +
+  scale_color_manual(name = '', values = c('Realized data'='black','Latent mean function'='red','Posterior mean functions'= 'blue','Posterior mean function'='green')) +
   xlab('X') + 
   ylab('y') +
   ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
@@ -358,6 +361,21 @@ ppc_interval_df <- function(yrep, y) {
                              q_25 = q_25,
                              q_05 = q_05,
                              mu = mu)
+  return(df_post_pred)
+}
+ppc_interval_norm_df <- function(means, sds, y) {
+  q_95 <- qnorm(0.95,mean = means, sd = sds)
+  q_75 <- qnorm(0.75,mean = means, sd = sds)
+  q_50 <- qnorm(0.5,mean = means, sd = sds)
+  q_25 <- qnorm(0.25,mean = means, sd = sds)
+  q_05 <- qnorm(0.05,mean = means, sd = sds)
+  df_post_pred <- data.frame(y_obs = y,
+                             q_95 = q_95,
+                             q_75 = q_75,
+                             q_50 = q_50,
+                             q_25 = q_25,
+                             q_05 = q_05,
+                             mu = means)
   return(df_post_pred)
 }
 interval_cover <- function(upper, lower, elements) {
@@ -493,7 +511,7 @@ model {
       cov[n, n] = cov[n, n] + square(sigma);
     L_cov = cholesky_decompose(cov);
   }
-  length_scale ~ normal(0, 1);
+  length_scale ~ gamma(2, 20);
   alpha ~ normal(0, 1);
   sigma ~ normal(0, 1);
   y ~ multi_normal_cholesky(zeros, L_cov);
@@ -528,13 +546,13 @@ stan_data_marg$sigma = marg_model_opt$par['sigma']
 
 ```{r engine='cat', engine.opts = list(file = "simple_marginal_gp_sim.stan", lang = "stan")}
 functions {
-  vector gp_pred_rng(real[] x_pred,
+  matrix gp_pred_rng(real[] x_pred,
                      vector y_is,
                      real[] x_is,
                      real alpha,
                      real length_scale,
                      real sigma) {
-    vector[size(x_pred)] f_pred;
+    matrix[2,size(x_pred)] f_pred;
     int N_pred;
     int N;
     N_pred = size(x_pred);
@@ -559,9 +577,10 @@ functions {
       f_pred_mu = (k_x_is_x_pred' * K_div_y_is); 
       v_pred = mdivide_left_tri_low(L_Sigma, k_x_is_x_pred);
       cov_f_pred = cov_exp_quad(x_pred, alpha, length_scale) - v_pred' * v_pred;
-      nug_pred = diag_matrix(rep_vector(1e-12,N_pred));
-
-      f_pred = multi_normal_rng(f_pred_mu, cov_f_pred + nug_pred);
+      
+      f_pred[1,] = f_pred_mu';
+      for (n in 1:N_pred)
+        f_pred[2,n] = sqrt(cov_f_pred[n,n] + square(sigma));
     }
     return f_pred;
   }
@@ -579,37 +598,34 @@ data {
 model {
 }
 generated quantities {
-  vector[N_pred] f_pred;
-  vector[N_pred] y_pred;
+  matrix[2,N_pred] f_pred;
 
   f_pred = gp_pred_rng(x_pred, y, x, alpha, length_scale, sigma);
-  for (n in 1:N_pred)
-    y_pred[n] = normal_rng(f_pred[n], sigma);
 }
 ```
 
 ```{r, results="hide", message=FALSE, echo=FALSE}
 marg_model_sim <- stan_model('simple_marginal_gp_sim.stan')
-marg_draws <- sampling(marg_model_sim,iter=2000,algorithm='Fixed_param',
+marg_draws <- sampling(marg_model_sim,iter=1,algorithm='Fixed_param',
                  chains = 1,data = stan_data_marg)
 ```
 
 ```{r, results ="hide", message=FALSE}
 samps_marg <- rstan::extract(marg_draws)
-ppc_max_marg <- ppc_interval_df(samps_marg$y_pred, samps$y[1,-set])
+ppc_max_marg <- ppc_interval_norm_df(samps_marg$f_pred[1,1,], samps_marg$f_pred[1,2,], samps$y[1,-set])
 ```
 
 `r round(100*interval_cover(ppc_max_marg$q_95,ppc_max_marg$q_05, ppc_max_marg$y_obs))`\%
 of out-of-sample data points are in the 90\% posterior predictive interval.
 
 `r round(100*interval_cover(ppc_max_marg$q_75,ppc_max_marg$q_25, ppc_max_marg$y_obs))`\% 
-of out-of-sample data points are in the 90\% posterior predictive interval.
+of out-of-sample data points are in the 50\% posterior predictive interval.
 
 Like above, we can calculate RMSE for our mean predictions.
 
 ```{r}
-rmse_max_marg <- ppc_rmse(samps_marg$y_pred, samps$y[1,-set])
-mae_max_marg <- ppc_mae(samps_marg$y_pred, samps$y[1,-set])
+rmse_max_marg <- sqrt(mean((samps_marg$f_pred[1,1,] - samps$y[1,-set])^2))
+mae_max_marg <- mean(abs(samps_marg$f_pred[1,1,] - samps$y[1,-set]))
 ```
 
 The mean of the distribution of the RMSE for the penalized maximum marginal likelihood
@@ -620,22 +636,26 @@ ppc_max_marg$x <- samps$x[1,-set]
 ggplot(data = ppc_max_marg, aes(x = x, y = y_obs)) +
   geom_ribbon(aes(ymax = q_95, ymin = q_05,alpha=0.5, colour = '95% predictive interval')) + geom_point(aes(colour = 'Out-of-sample data'),alpha=0.5) + theme_bw() +
   geom_point(data = plt_df[set,], aes(x = x, y = y, colour='Observed data')) + theme(legend.position="bottom") +
+  geom_line(data = ppc_max_marg, aes(x = x, y = mu, colour = 'Posterior predictive mean')) +
   scale_color_manual(name = '', values = c('Observed data'='red',
                                            '95% predictive interval'='blue',
-                                           'Out-of-sample data'= 'black')) +
+                                           'Out-of-sample data'= 'black',
+                                           'Posterior predictive mean'='green')) +
   xlab('X') + 
   ylab('y') +
   ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
 ```
 
-```{r}
+```{r, cache=TRUE}
 ppc_full_bayes$x <- samps$x[1,-set]
 ggplot(data = ppc_full_bayes, aes(x = x, y = y_obs)) +
   geom_ribbon(aes(ymax = q_95, ymin = q_05,alpha=0.5, colour = '95% predictive interval')) + geom_point(aes(colour = 'Out-of-sample data'),alpha=0.5) + theme_bw() +
   geom_point(data = plt_df[set,], aes(x = x, y = y, colour='Observed data')) + theme(legend.position="bottom") +
+  geom_line(data = ppc_full_bayes, aes(x = x, y = mu, colour = 'Posterior predictive mean')) +
   scale_color_manual(name = '', values = c('Observed data'='red',
                                            '95% predictive interval'='blue',
-                                           'Out-of-sample data'= 'black')) +
+                                           'Out-of-sample data'= 'black',
+                                           'Posterior predictive mean'='green')) +
   xlab('X') + 
   ylab('y') +
   ggtitle(paste0('N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
@@ -702,7 +722,7 @@ transformed parameters {
   }
 }
 model {
-  length_scale ~ normal(0, 1);
+  length_scale ~ gamma(2, 20);
   alpha ~ normal(0, 1);
   eta ~ normal(0, 1);
   y ~ poisson_log(f[1:N]);
@@ -1132,7 +1152,7 @@ compiled_model <- stan_model("hierarchical_gp.stan")
 
 ```{r, cache=TRUE}
 fit <- sampling(compiled_model, data = to_stan, iter = 2000,
-                chains = 4, cores = 2, seed = 1245860998)
+                chains = 4, cores = 4, seed = 1245860998)
 ```
 
 Let's inspect the results for convergence of parameters.
