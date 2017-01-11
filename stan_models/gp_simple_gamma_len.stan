@@ -22,7 +22,7 @@ functions {
       matrix[N, N] Sigma;
       Sigma = cov_exp_quad(x_is, alpha, length_scale);
       for (n in 1:N)
-        Sigma[n, n] = Sigma[n,n] + sigma;
+        Sigma[n, n] = Sigma[n,n] + square(sigma);
       L_Sigma = cholesky_decompose(Sigma);
       K_div_y_is = mdivide_left_tri_low(L_Sigma, y_is);
       K_div_y_is = mdivide_right_tri_low(K_div_y_is',L_Sigma)';
