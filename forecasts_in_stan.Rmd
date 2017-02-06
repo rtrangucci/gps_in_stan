@@ -13,6 +13,7 @@ library(ggplot2)
 library(rstan)
 library(reshape2)
 library(printr)
+library(gridExtra)
 set.seed(123)
 multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
   library(grid)
@@ -67,44 +68,52 @@ scalar $x$.
 
 The generative model for a Gaussian process regression is as follows:
 
-\begin{align*}
+$$
+\begin{aligned}
   \theta & \sim g(\phi) \\
   f(x) & \sim \text{GP}\left( \mu(x),
   k_\theta(x) \right) \\
   y_i & \sim \mathcal{N}\left( f(x_i), \sigma \right) \forall i
-\end{align*}
+\end{aligned}
+$$
 
 A GP is a stochastic process, indexed by $x \in \mathbb{R}$. Any finite sample
 realized from this stochastic process is jointly multivariate normal
 [@cramer2004stationary]. $\mu(x)$ is the mean of $f(x)$, and $k_\theta(x)$, a
 kernel, defines the covariance between any two evaluations of $f(x)$:
 
-\begin{align*}
+$$
+\begin{aligned}
 \text{cov}(f(x_i),f(x_j)) = k(x_i, x_j | \theta)
-\end{align*}
+\end{aligned}
+$$
 
 The kernel $k$ is parameterized by a vector $\theta$, and is required
 to a be a positive-semidefinite function [@rasmussen2005gaussian].
 
 The finite-dimensional generative model for the GP is:
 
-\begin{align*}
+$$
+\begin{aligned}
 \theta & \sim g(\phi) \\
 f & \sim \text{MultiNormal}(0, K_{\theta}(x)) \\
 y_i & \sim \text{Normal}(f_i, \sigma) \, \forall i \in \{1,\dots,N\}
-\end{align*}
+\end{aligned}
+$$
 
 Above, $K_{\theta}(x)$ is an $N \times N$ covariance matrix, where each entry 
 $K[i, j] = k(x_i, x_j | \theta)$. The exponentiated quadratic kernel has two
 components to theta, $\alpha$, the marginal standard deviation of the stochastic
 process $f$ and $\ell$, the process length-scale.
 
-\begin{align}
+$$
+\begin{aligned}
   k(x_i, x_j | \theta) = \alpha^2 
 \exp \left(
 	- \dfrac{1}{2\ell^2} (x_{i} - x_{j})^2
 \right)
-\end{align}
+\end{aligned}
+$$
 
 This kernel's defining quality is its smoothness; the function is infinitely 
 differentiable. This can sometimes be unrealistic for applied work (see 
@@ -239,11 +248,14 @@ parameterization of a multivariate normal. Suppose we have a covariance matrix,
 $\Sigma$. Because it is a proper covariance matrix, there exists a
 lower-triangular matrix $L$ such that $L \times L^T = \Sigma$. We know that:
 
-\begin{align*}
+$$
+\begin{aligned}
+L \times L^T & =  \Sigma\\
 \eta_i & \sim \text{Normal}(0, 1) \, \forall i \in \{1,\dots,N\} \\
 f & = L \eta \\
 f & \sim \text{MultiNormal}(0, \Sigma) 
-\end{align*}
+\end{aligned}
+$$
 
 The reason to express $f$ as a \texttt{transformed\_parameter} is because it 
 removes the prior dependence of the density of $f$ on $\alpha$ and $\ell$. When 
@@ -316,7 +328,7 @@ We prep the data for modeling and inference in Stan:
 
 ```{r}
 stan_data <- list(N = length(set), N_pred = dat_list$N - length(set),
-                  zeros =rep(0,length(set)), x = samps$x[1,set], y = samps$y[1,set],
+                  x = samps$x[1,set], y = samps$y[1,set],
                   x_pred = samps$x[1,-set], f_pred = samps$f[1,-set])
 ```
 
@@ -438,33 +450,30 @@ likelihood estimation of the hyperparameters.
 
 We can also express the GP with a normal likelihood like so:
 
-\begin{align}
+\begin{align*}
   p(y | \alpha, \ell, \sigma) = \int p(y | f, \sigma) p(f | \alpha, \ell) df
-\end{align}
+\end{align*}
 
 It turns out that $p(y | \alpha, \ell, \sigma)$ is multivariate normal with with
 a covariance matrix parameterized by a new kernel that integrates the noise
 $\sigma$ with the exponentiated quadratic:
 
-\begin{align}
+\begin{align*}
   k(x_i, x_j | \theta) = \alpha^2 
 \exp \left(
 	- \dfrac{1}{2\ell^2} (x_{i} - x_{j})^2
 \right) + \delta_{ij} \sigma^2
-\end{align}
+\end{align*}
 
 Above, $\delta_{ij}$ is the Dirac delta function, taking the value of 1 when $i = j$ and
 remaining zero otherwise.
 
 Thus, the generative model is now:
 
-\begin{align}
-\ell & \sim \text{Gamma}(2,2) \\
-\alpha & \sim \text{Half-Normal}(0, 1) \\
-\sigma & \sim \text{Half-Normal}(0, 1) \\
+\begin{align*}
 \mathbf{y} & \sim \text{MultiNormal}(0, K_{\ell,\alpha}(\mathbf{x},\mathbf{x}) + \sigma^2 I_n) \\
 &            \mathbf{y}, \mathbf{x} \in \mathbb{R}^N
-\end{align}
+\end{align*}
 
 This is a much lower-dimensional representation of a GP. It takes the model from a
 $N + 3$ dimensional parameter space to a 3-dimensional parameter space. This will
@@ -502,15 +511,13 @@ model {
       cov[n, n] = cov[n, n] + square(sigma);
     L_cov = cholesky_decompose(cov);
   }
-//  length_scale ~ gamma(2, 20);
-//  alpha ~ normal(0, 1);
-//  sigma ~ normal(0, 1);
   y ~ multi_normal_cholesky(zeros, L_cov);
 }
 ```
 
-Let's find the penalized MLEs for $\alpha$, $\delta$, and $\ell$. We can do this
-easily in RStan by calling \texttt{optimizing} on the compiled model.
+Let's find the MLEs for $\alpha$, $\delta$, and $\ell$. We can do this easily in
+RStan by calling \texttt{optimizing} on the compiled model. The call to
+optimizing runs L-BFGS to arrive at point-estimates for our hyperparameters.
 
 ```{r, results="hide", message=FALSE, echo=FALSE, cache=TRUE}
 marg_model <- stan_model('simple_marginal_gp.stan')
@@ -520,12 +527,14 @@ marg_model <- stan_model('simple_marginal_gp.stan')
 marg_model_opt <- optimizing(marg_model, data = stan_data)
 ```
 
+The estimates for the parameters is shown below.
+
 ```{r}
 marg_model_opt$par
 ```
 
-We can see that these estimates are biased a bit, but this is to be expected 
-because we have a finite sample of data and priors on the hyperparameters.
+We can see that these estimates are quite biased, but this is to be expected 
+because we have a finite sample of data.
 
 ```{r}
 stan_data_marg <- stan_data
@@ -533,7 +542,6 @@ stan_data_marg$length_scale = marg_model_opt$par['length_scale']
 stan_data_marg$alpha = marg_model_opt$par['alpha']
 stan_data_marg$sigma = marg_model_opt$par['sigma']
 ```
-
 
 ```{r engine='cat', engine.opts = list(file = "simple_marginal_gp_sim.stan", lang = "stan")}
 functions {
@@ -612,6 +620,11 @@ of out-of-sample data points are in the 90\% posterior predictive interval.
 `r round(100*interval_cover(ppc_max_marg$q_75,ppc_max_marg$q_25, ppc_max_marg$y_obs))`\% 
 of out-of-sample data points are in the 50\% posterior predictive interval.
 
+Clearly the intervals do not provide adequate cover compared to their full
+Bayesian counterparts. The following plots will elucidate why we should put
+priors on our hyperparameters and integrate over the uncertainty in our
+hyperparameter estimates.
+
 ```{r, cache=TRUE}
 ppc_max_marg$x <- samps$x[1,-set]
 ggplot(data = ppc_max_marg, aes(x = x, y = y_obs)) +
@@ -641,7 +654,7 @@ ggplot(data = ppc_full_bayes, aes(x = x, y = y_obs)) +
   ylab('y') +
   ggtitle(paste0('Full Bayes PP intervals for N=',length(set),' from length-scale = 0.15, alpha = 1, sigma = 0.32'))
 ```
-  
+
 \section{GP with Poisson outcome}
 
 Let's say we have count data now, and we want to fit the data using a GP 
@@ -887,18 +900,18 @@ national trends. Because our outcome data will be a proportion we'll use a beta
 density for our likelihood. The beta distribution has support in $[0,1]$ and is
 canonically parameterized with two shape parameters, $\gamma$ and $\beta$.
 
-\begin{align}
+\begin{align*}
 p(y | \gamma, \beta) = \dfrac{1}{\text{B}(\gamma, \beta)} 
 y ^ {\gamma - 1} (1 - y)^{\beta - 1}
-\end{align}
+\end{align*}
 
 We can reparameterize the distribution in terms of its mean $\mathbb{E}[y] = \mu$ and precision, $\text{Var}[y] = \dfrac{\mu (1 - \mu)}{(1 + \nu)}$
 [@betareg].
 
-\begin{align}
+\begin{align*}
 p(y | \mu, \nu) = \dfrac{1}{\text{B}(\mu \nu, (1 - \mu) \nu)} 
 y ^ {\mu \nu - 1} (1 - y)^{(1 - \mu) \nu - 1}
-\end{align}
+\end{align*}
 
 We'll use the alternative parameterization for our regression. Note that 
 $\nu = \gamma + \beta$. We can think of $\nu$ as being the prior sample size,
@@ -1131,8 +1144,10 @@ order to put multivariate normal priors on each $\boldsymbol{\gamma_j}$:
 \boldsymbol{\gamma_{j}} & \sim \text{MultiNormal}(0, K_{\ell^\gamma_1, \alpha^\gamma_1} + K_{\ell^\gamma_2, \alpha^\gamma_2})
 \end{align*}
 
-we generate an auxiliary set of random variables, $\eta \in \mathbb{R}^{T,J}$, and 
-decompose the covariance matrix $K_{\ell^\gamma_1, \alpha^\gamma_1} + K_{\ell^\gamma_2, \alpha^\gamma_2}$ into a lower triangular matrix $L$:
+we generate an auxiliary set of random variables, $\eta \in \mathbb{R}^{T,J}$, 
+$\eta[t,j] \sim \text{Normal}(0, 1) \, \forall \, t \in \{1,\dots,T\} \, , j \in \{1, \dots, J\}$,
+and decompose the covariance matrix $K_{\ell^\gamma_1, \alpha^\gamma_1} +
+K_{\ell^\gamma_2, \alpha^\gamma_2}$ into a lower triangular matrix $L$:
 
 \begin{align*}
 L \times L^T = K_{\ell^\gamma_1, \alpha^\gamma_1} + K_{\ell^\gamma_2, \alpha^\gamma_2}
@@ -1198,7 +1213,7 @@ ggplot(wy_melt, aes(x = year, y = value, group = variable)) +
 ```
 
 This comports with our intuition that Wyoming should be firmly Republican in 2020. The 
-model's posterior mass on a Democratic win in Wyoming in 2020 is less than a percent:
+model's posterior mass on a Democratic win in Wyoming in 2020 is `round(100*apply(wy_preds < 0.5,2,mean),1)[year_vec == 2016]`:
 
 ```{r}
 dem_win_wy <- data.frame(year = year_vec, 
@@ -1297,10 +1312,10 @@ plts[['Mountain West']]
 
 \section{Conclusion}
 
-GPs are a flexible class of priors over random variables in probabilistic
+GPs are a flexible class of priors over random variables in probabilistic 
 models. We can integrate Gaussian processes into Stan models easily using 
-\texttt{cov\_exp\_quad}. The latent variable formulation of the GP is 
-particularly useful when defining the GP prior over parameters that are
-weakly informed by the data. 
+\texttt{cov\_exp\_quad} and \texttt{cholesky\_decompose}. The non-centered
+latent variable formulation of the GP is particularly useful when defining the
+GP prior over parameters that are weakly informed by the data.
 
 # REFERENCES
