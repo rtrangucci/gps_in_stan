@@ -2,8 +2,8 @@
 title: "Hierarchical Gaussian Processes in Stan"
 author: "Rob Trangucci"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 bibliography: bib_inf_priors.bib
 ---
 
@@ -132,8 +132,8 @@ $\ell$ and $\alpha$).
 ```{r engine='cat', engine.opts = list(file = "simple_latent_gp.stan", lang = "stan")}
 functions {
   vector gp_pred_rng(real[] x_pred,
-                     vector y_is,
-                     real[] x_is,
+                     vector y,
+                     real[] x,
                      real alpha,
                      real length_scale,
                      real sigma) {
@@ -141,26 +141,26 @@ functions {
     int N_pred;
     int N;
     N_pred = size(x_pred);
-    N = rows(y_is);
+    N = rows(y);
 
     {
       matrix[N, N] L_Sigma;
-      vector[N] K_div_y_is;
-      matrix[N, N_pred] k_x_is_x_pred;
+      vector[N] K_div_y;
+      matrix[N, N_pred] k_x_x_pred;
       matrix[N, N_pred] v_pred;
       vector[N_pred] f_pred_mu;
       matrix[N_pred, N_pred] cov_f_pred;
       matrix[N_pred, N_pred] nug_pred;
       matrix[N, N] Sigma;
-      Sigma = cov_exp_quad(x_is, alpha, length_scale);
+      Sigma = cov_exp_quad(x, alpha, length_scale);
       for (n in 1:N)
         Sigma[n, n] = Sigma[n,n] + square(sigma);
       L_Sigma = cholesky_decompose(Sigma);
-      K_div_y_is = mdivide_left_tri_low(L_Sigma, y_is);
-      K_div_y_is = mdivide_right_tri_low(K_div_y_is',L_Sigma)';
-      k_x_is_x_pred = cov_exp_quad(x_is, x_pred, alpha, length_scale);
-      f_pred_mu = (k_x_is_x_pred' * K_div_y_is); 
-      v_pred = mdivide_left_tri_low(L_Sigma, k_x_is_x_pred);
+      K_div_y = mdivide_left_tri_low(L_Sigma, y);
+      K_div_y = mdivide_right_tri_low(K_div_y',L_Sigma)';
+      k_x_x_pred = cov_exp_quad(x, x_pred, alpha, length_scale);
+      f_pred_mu = (k_x_x_pred' * K_div_y); 
+      v_pred = mdivide_left_tri_low(L_Sigma, k_x_x_pred);
       cov_f_pred = cov_exp_quad(x_pred, alpha, length_scale) - v_pred' * v_pred;
       nug_pred = diag_matrix(rep_vector(1e-12,N_pred));
 
@@ -546,8 +546,8 @@ stan_data_marg$sigma = marg_model_opt$par['sigma']
 ```{r engine='cat', engine.opts = list(file = "simple_marginal_gp_sim.stan", lang = "stan")}
 functions {
   matrix gp_pred_rng(real[] x_pred,
-                     vector y_is,
-                     real[] x_is,
+                     vector y,
+                     real[] x,
                      real alpha,
                      real length_scale,
                      real sigma) {
@@ -555,26 +555,26 @@ functions {
     int N_pred;
     int N;
     N_pred = size(x_pred);
-    N = rows(y_is);
+    N = rows(y);
 
     {
       matrix[N, N] L_Sigma;
-      vector[N] K_div_y_is;
-      matrix[N, N_pred] k_x_is_x_pred;
+      vector[N] K_div_y;
+      matrix[N, N_pred] k_x_x_pred;
       matrix[N, N_pred] v_pred;
       vector[N_pred] f_pred_mu;
       matrix[N_pred, N_pred] cov_f_pred;
       matrix[N_pred, N_pred] nug_pred;
       matrix[N, N] Sigma;
-      Sigma = cov_exp_quad(x_is, alpha, length_scale);
+      Sigma = cov_exp_quad(x, alpha, length_scale);
       for (n in 1:N)
         Sigma[n, n] = Sigma[n,n] + square(sigma);
       L_Sigma = cholesky_decompose(Sigma);
-      K_div_y_is = mdivide_left_tri_low(L_Sigma, y_is);
-      K_div_y_is = mdivide_right_tri_low(K_div_y_is',L_Sigma)';
-      k_x_is_x_pred = cov_exp_quad(x_is, x_pred, alpha, length_scale);
-      f_pred_mu = (k_x_is_x_pred' * K_div_y_is); 
-      v_pred = mdivide_left_tri_low(L_Sigma, k_x_is_x_pred);
+      K_div_y = mdivide_left_tri_low(L_Sigma, y);
+      K_div_y = mdivide_right_tri_low(K_div_y',L_Sigma)';
+      k_x_x_pred = cov_exp_quad(x, x_pred, alpha, length_scale);
+      f_pred_mu = (k_x_x_pred' * K_div_y); 
+      v_pred = mdivide_left_tri_low(L_Sigma, k_x_x_pred);
       cov_f_pred = cov_exp_quad(x_pred, alpha, length_scale) - v_pred' * v_pred;
       
       f_pred[1,] = f_pred_mu';
